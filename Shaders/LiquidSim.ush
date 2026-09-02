@@ -1,0 +1,378 @@
+// =============================================================================
+//  LiquidSim.ush - Unreal adapter layer
+//
+//  Thin wrappers around LiquidSimCore.ush. This file exists only to bridge
+//  things that are engine-specific and therefore cannot live in the portable
+//  core:
+//
+//    * texture objects and samplers (render targets, cubemaps, ground maps)
+//    * flat parameter lists, because a material Custom node feeds one pin per
+//      value and cannot build a struct on its own
+//
+//  ALL MATHS LIVES IN THE CORE. If you are reading this to understand how an
+//  effect works, open LiquidSimCore.ush instead - every function below is a
+//  two-line forwarding call.
+//
+//  Virtual path: /Project/LiquidSim.ush
+//  Author: Max Okhrimenko
+// =============================================================================
+
+#pragma once
+
+#include "/Project/LiquidSimCore.ush"
+
+// Builds the core's noise settings from the loose pins of a Custom node.
+LS_NoiseParams LiquidSim_MakeNoise(float size, float speed, float seed, float type,
+                                   float octaves, float lacunarity, float persistence)
+{
+	LS_NoiseParams np;
+	np.Size = size;
+	np.Speed = speed;
+	np.Seed = seed;
+	np.Type = type;
+	np.Octaves = octaves;
+	np.Lacunarity = lacunarity;
+	np.Persistence = persistence;
+	return np;
+}
+
+// =============================================================================
+//  LVL 1 - Chameleon
+//  Engine-specific part: sampling the reflection cubemap at a roughness-picked
+//  mip. Everything else is LS_ShadeChameleon.
+// =============================================================================
+float3 LiquidSim_ChameleonShader(
+	float3 worldNormal, float3 cameraVec,
+	float3 colorA, float3 colorB, float3 colorC,
+	float roughA, float roughB, float roughC,
+	TextureCube cube, SamplerState cubeSampler,
+	float3 highlightColor, float reflectivity, float gradientBoost,
+	float fresnelPower, float gradientShift,
+	out float3 outEmissive, out float outRoughness)
+{
+	// A first pass with no reflection tells us the roughness, which then picks
+	// the cubemap mip - rough bands blur their reflection.
+	LS_Surface probe = LS_ShadeChameleon(worldNormal, cameraVec, colorA, colorB, colorC,
+		roughA, roughB, roughC, float3(0.0, 0.0, 0.0), highlightColor,
+		reflectivity, gradientBoost, fresnelPower, gradientShift);
+
+	float3 r = reflect(-normalize(cameraVec), normalize(worldNormal));
+	float3 reflection = cube.SampleLevel(cubeSampler, r, probe.Roughness * 4.0).rgb;
+
+	LS_Surface s = LS_ShadeChameleon(worldNormal, cameraVec, colorA, colorB, colorC,
+		roughA, roughB, roughC, reflection, highlightColor,
+		reflectivity, gradientBoost, fresnelPower, gradientShift);
+
+	outEmissive = s.Emissive;
+	outRoughness = s.Roughness;
+	return s.BaseColor;
+}
+
+// =============================================================================
+//  LVL 2 - Perlin displacement (no textures - a straight forward)
+// =============================================================================
+LS_Surface LiquidSim_DisplacementShader(
+	float3 worldNormal, float2 uv, float time,
+	float noiseSize, float noiseSpeed, float amplitude,
+	float noiseSeed, float noiseType, float noiseOctaves,
+	float lacunarity, float persistence,
+	float3 colorLow, float3 colorMid, float3 colorHigh,
+	float roughness)
+{
+	LS_NoiseParams np = LiquidSim_MakeNoise(noiseSize, noiseSpeed, noiseSeed,
+	                                        noiseType, noiseOctaves, lacunarity, persistence);
+	float tap = 0.05 / max(noiseSize, 0.001); // constant UV step, any noise size
+
+	float hC = LS_HeightPerlin(uv, time, np);
+	float hU = LS_HeightPerlin(uv + float2(tap, 0.0), time, np);
+	float hV = LS_HeightPerlin(uv + float2(0.0, tap), time, np);
+
+	return LS_ShadeDisplacement(worldNormal, hC, hU, hV, amplitude,
+	                            colorLow, colorMid, colorHigh, roughness);
+}
+
+// =============================================================================
+//  LVL 3/4/5 - paint simulation pass
+//  Engine-specific part: reading the previous frame's render target.
+// =============================================================================
+float3 LiquidSim_PaintStep(
+	Texture2D prevHeightMap, SamplerState prevHeightMapSampler, float2 uv,
+	float decay, float decayVariation, float viscosity, float springDamp, float velocityMax,
+	float smoothing, float texelSize, float waveTapUV,
+	float brushU, float brushV, float brushPrevU, float brushPrevV,
+	float radius, float softness,
+	float depth, float rimHeight, float rimOffset, float rimWidth, float raggedness,
+	float brushStrength, float wetnessDecay, float maxHeight, float deltaTime)
+{
+	float3 prev = prevHeightMap.SampleLevel(prevHeightMapSampler, uv, 0).rgb;
+
+	// four neighbours: the smoothing target and the wave laplacian in one.
+	// The UVs are SATURATED, and that is not cosmetic: a render target samples
+	// with Wrap by default, so a wave reaching the right edge would read its
+	// neighbour from the LEFT edge and re-emerge on the opposite side of the
+	// surface. Clamping instead makes the border reflect the wave back, which
+	// is also what a real container wall does. Done here rather than by
+	// changing the asset's address mode so the behaviour cannot be broken by
+	// re-importing or re-creating the render target.
+	float tap = LS_WaveTapDistance(texelSize, waveTapUV);
+	float avg = 0.25 * (
+		  prevHeightMap.SampleLevel(prevHeightMapSampler, saturate(uv + float2(tap, 0.0)), 0).r
+		+ prevHeightMap.SampleLevel(prevHeightMapSampler, saturate(uv - float2(tap, 0.0)), 0).r
+		+ prevHeightMap.SampleLevel(prevHeightMapSampler, saturate(uv + float2(0.0, tap)), 0).r
+		+ prevHeightMap.SampleLevel(prevHeightMapSampler, saturate(uv - float2(0.0, tap)), 0).r);
+
+	LS_BrushParams brush;
+	brush.Pos = float2(brushU, brushV);
+	brush.PrevPos = float2(brushPrevU, brushPrevV);
+	brush.Radius = radius;
+	brush.Softness = softness;
+	brush.Depth = depth;
+	brush.RimHeight = rimHeight;
+	brush.RimOffset = rimOffset;
+	brush.RimWidth = rimWidth;
+	brush.Raggedness = raggedness;
+	brush.Strength = brushStrength;
+
+	LS_SimParams sim;
+	sim.Decay = decay;
+	sim.DecayVariation = decayVariation;
+	sim.Viscosity = viscosity;
+	sim.SpringDamp = springDamp;
+	sim.VelocityMax = velocityMax;
+	sim.Smoothing = smoothing;
+	sim.WetnessDecay = wetnessDecay;
+	sim.MaxHeight = maxHeight;
+	sim.DeltaTime = deltaTime;
+
+	return LS_PaintStep(prev, avg, uv, brush, sim);
+}
+
+// =============================================================================
+//  LVL 3/4 - painted surface display
+//  Engine-specific part: sampling the height render target three times.
+// =============================================================================
+LS_Surface LiquidSim_PaintedSurfaceShader(
+	float3 worldNormal, float2 uv,
+	Texture2D heightMap, SamplerState heightMapSampler,
+	float amplitude,
+	float3 colorBase, float3 colorLow, float3 colorMid, float3 colorHigh,
+	float heightColorScale, float wetSensitivity,
+	float roughnessDry, float roughnessWet)
+{
+	float tap = 0.004;
+	float3 hvw = heightMap.SampleLevel(heightMapSampler, uv, 0).rgb;
+	float hU = heightMap.SampleLevel(heightMapSampler, saturate(uv + float2(tap, 0.0)), 0).r;
+	float hV = heightMap.SampleLevel(heightMapSampler, saturate(uv + float2(0.0, tap)), 0).r;
+
+	return LS_ShadePainted(worldNormal, hvw.r, hU, hV, hvw.b, amplitude,
+	                       colorBase, colorLow, colorMid, colorHigh,
+	                       heightColorScale, wetSensitivity, roughnessDry, roughnessWet);
+}
+
+// =============================================================================
+//  LVL 5 - Boss
+//  Split in two because World Position Offset compiles in the VERTEX shader,
+//  where CameraVector does not exist. Displace is vertex-safe; Shade is
+//  pixel-only.
+// =============================================================================
+struct FLiquidSimBossDisplace
+{
+	float3 Offset;
+	float3 Normal;
+	float  NoiseHeight;
+	float  PaintHeight;
+	float  Wetness;
+};
+
+FLiquidSimBossDisplace LiquidSim_BossDisplace(
+	float3 worldNormal, float2 uv, float time,
+	Texture2D heightMap, SamplerState heightMapSampler,
+	float noiseSize, float noiseSpeed, float noiseAmplitude,
+	float noiseSeed, float noiseType, float noiseOctaves, float lacunarity, float persistence,
+	float paintAmplitude)
+{
+	LS_NoiseParams np = LiquidSim_MakeNoise(noiseSize, noiseSpeed, noiseSeed,
+	                                        noiseType, noiseOctaves, lacunarity, persistence);
+	float noiseTap = 0.05 / max(noiseSize, 0.001);
+	float uvTap = 0.004;
+
+	float nC = LS_HeightPerlin(uv, time, np);
+	float nU = LS_HeightPerlin(uv + float2(noiseTap, 0.0), time, np);
+	float nV = LS_HeightPerlin(uv + float2(0.0, noiseTap), time, np);
+
+	float3 pcw = heightMap.SampleLevel(heightMapSampler, uv, 0).rgb;
+	float pU = heightMap.SampleLevel(heightMapSampler, saturate(uv + float2(uvTap, 0.0)), 0).r;
+	float pV = heightMap.SampleLevel(heightMapSampler, saturate(uv + float2(0.0, uvTap)), 0).r;
+
+	FLiquidSimBossDisplace d;
+	LS_BossDisplace(worldNormal, nC, nU, nV, noiseAmplitude,
+	                pcw.r, pU, pV, paintAmplitude, d.Offset, d.Normal);
+	d.NoiseHeight = nC;
+	d.PaintHeight = pcw.r;
+	d.Wetness = pcw.b;
+	return d;
+}
+
+LS_Surface LiquidSim_BossShade(
+	float3 displacedNormal, float3 cameraVec, float2 uv, float time,
+	float paintHeight, float noiseHeight, float wetness,
+	float3 baseDark, float3 colorA, float3 colorB, float3 colorC,
+	float3 troughColor, float3 edgeColor, float3 foamColor,
+	float activitySensitivity, float troughSensitivity,
+	float troughGlow, float interiorGlow, float edgeDither, float foamIntensity,
+	float idleBreathing, float roughIdle, float roughActive,
+	float sparkleScale, float sparkleIntensity)
+{
+	return LS_ShadeBoss(displacedNormal, cameraVec, uv, time,
+		paintHeight, noiseHeight, wetness,
+		baseDark, colorA, colorB, colorC, troughColor, edgeColor, foamColor,
+		activitySensitivity, troughSensitivity, troughGlow, interiorGlow,
+		edgeDither, foamIntensity, idleBreathing, roughIdle, roughActive,
+		sparkleScale, sparkleIntensity);
+}
+
+// =============================================================================
+//  LVL 6 - Vortex (procedural; the height map input is kept for compatibility
+//  but the placed instance sets PaintAmplitude to 0)
+// =============================================================================
+struct FLiquidSimVortexDisplace
+{
+	float3 Offset;
+	float3 Normal;
+	float  PaintHeight;
+	float  CentreDist;
+};
+
+FLiquidSimVortexDisplace LiquidSim_VortexDisplace(
+	float3 worldNormal, float2 uv, float time,
+	Texture2D heightMap, SamplerState heightMapSampler,
+	float noiseSize, float noiseSpeed, float noiseAmplitude,
+	float noiseSeed, float noiseType, float noiseOctaves, float lacunarity, float persistence,
+	float swirlStrength, float swirlTightness, float swirlSpeed, float warpStrength,
+	float funnelDepth, float funnelTightness, float paintAmplitude)
+{
+	LS_NoiseParams np = LiquidSim_MakeNoise(noiseSize, noiseSpeed, noiseSeed,
+	                                        noiseType, noiseOctaves, lacunarity, persistence);
+	float tap = 0.01;
+
+	// the core's vortex height is unit-scaled; amplitude and the painted
+	// contribution are applied here
+	float hC = LS_HeightVortex(uv, time, np, swirlStrength, swirlTightness, swirlSpeed,
+	                           warpStrength, funnelDepth, funnelTightness) * noiseAmplitude;
+	float hU = LS_HeightVortex(uv + float2(tap, 0.0), time, np, swirlStrength, swirlTightness,
+	                           swirlSpeed, warpStrength, funnelDepth, funnelTightness) * noiseAmplitude;
+	float hV = LS_HeightVortex(uv + float2(0.0, tap), time, np, swirlStrength, swirlTightness,
+	                           swirlSpeed, warpStrength, funnelDepth, funnelTightness) * noiseAmplitude;
+
+	float pC = heightMap.SampleLevel(heightMapSampler, uv, 0).r;
+	float pU = heightMap.SampleLevel(heightMapSampler, saturate(uv + float2(tap, 0.0)), 0).r;
+	float pV = heightMap.SampleLevel(heightMapSampler, saturate(uv + float2(0.0, tap)), 0).r;
+
+	FLiquidSimVortexDisplace d;
+	LS_SurfaceFromHeights(worldNormal,
+		hC + pC * paintAmplitude, hU + pU * paintAmplitude, hV + pV * paintAmplitude,
+		d.Offset, d.Normal);
+	d.PaintHeight = pC;
+	d.CentreDist = length(uv - 0.5);
+	return d;
+}
+
+LS_Surface LiquidSim_VortexShade(
+	float3 displacedNormal, float3 cameraVec, float2 uv, float time,
+	float paintHeight, float centreDist,
+	float3 colorA, float3 colorB, float3 colorC,
+	float3 coreColor, float3 foamColor,
+	float coreGlow, float coreTightness, float pulseSpeed, float pulseAmount,
+	float activitySensitivity, float foamIntensity,
+	float roughIdle, float roughActive,
+	float sparkleScale, float sparkleIntensity,
+	float bandArms, float bandTwist, float bandNoiseScale,
+	float bandNoiseAmount, float bandContrast,
+	float noiseSize, float noiseSpeed, float noiseSeed,
+	float lacunarity, float persistence,
+	float swirlStrength, float swirlTightness, float swirlSpeed)
+{
+	LS_NoiseParams np = LiquidSim_MakeNoise(noiseSize, noiseSpeed, noiseSeed,
+	                                        2.0, 3.0, lacunarity, persistence);
+	return LS_ShadeVortex(displacedNormal, cameraVec, uv, time, centreDist,
+		colorA, colorB, colorC, coreColor, foamColor,
+		coreGlow, coreTightness, pulseSpeed, pulseAmount,
+		roughIdle, roughActive, sparkleScale, sparkleIntensity,
+		bandArms, bandTwist, bandNoiseScale, bandNoiseAmount, bandContrast,
+		np, swirlStrength, swirlTightness, swirlSpeed);
+}
+
+// =============================================================================
+//  LVL 7 - Rain over a ground material
+//  Engine-specific part: the ground's albedo / normal / roughness textures.
+// =============================================================================
+LS_Surface LiquidSim_RainShader(
+	float3 worldNormal, float2 uv, float time,
+	Texture2D baseTexture, SamplerState baseTextureSampler,
+	Texture2D baseNormalMap, SamplerState baseNormalMapSampler,
+	Texture2D baseRoughnessMap, SamplerState baseRoughnessMapSampler,
+	float baseTiling, float3 baseTint, float normalStrength, float roughnessMapInfluence,
+	float dropRate, float ringSpeed, float ringWidth, float ringFrequency,
+	float dropDensity, float sizeVariation, float amplitude,
+	float wetPatchScale, float wetPatchContrast, float wetDarkening,
+	float roughnessDry, float roughnessWet)
+{
+	float tap = 0.004;
+	float hC = LS_HeightRain(uv, time, dropRate, ringSpeed, ringWidth, ringFrequency, dropDensity, sizeVariation);
+	float hU = LS_HeightRain(uv + float2(tap, 0.0), time, dropRate, ringSpeed, ringWidth, ringFrequency, dropDensity, sizeVariation);
+	float hV = LS_HeightRain(uv + float2(0.0, tap), time, dropRate, ringSpeed, ringWidth, ringFrequency, dropDensity, sizeVariation);
+
+	float3 offset, rippleNormal;
+	LS_SurfaceFromHeights(worldNormal, hC * amplitude, hU * amplitude, hV * amplitude,
+	                      offset, rippleNormal);
+
+	// fold the ground's own normal map into the ripple normal
+	float2 tiledUV = uv * baseTiling;
+	float3 texN = baseNormalMap.SampleLevel(baseNormalMapSampler, tiledUV, 0).rgb * 2.0 - 1.0;
+	rippleNormal = normalize(rippleNormal + float3(texN.xy, 0.0) * normalStrength);
+
+	LS_NoiseParams np = LiquidSim_MakeNoise(1.0, 1.0, 4.0, 1.0, 3.0, 2.0, 0.5);
+	float wet = LS_WetPatchMask(uv, time, np, wetPatchScale, wetPatchContrast);
+
+	float3 albedo = baseTexture.SampleLevel(baseTextureSampler, tiledUV, 0).rgb * baseTint;
+	float texRough = baseRoughnessMap.SampleLevel(baseRoughnessMapSampler, tiledUV, 0).r;
+	float dryRough = lerp(roughnessDry, texRough, saturate(roughnessMapInfluence));
+
+	LS_Surface s = LS_ShadeRain(rippleNormal, hC, albedo, texRough, wet,
+	                            wetDarkening, dryRough, roughnessWet);
+	s.Offset = offset;
+	return s;
+}
+
+// =============================================================================
+//  LVL 8 - Lava (no textures - a straight forward)
+// =============================================================================
+LS_Surface LiquidSim_LavaShader(
+	float3 worldNormal, float2 uv, float time,
+	float noiseSize, float noiseSpeed, float amplitude,
+	float noiseSeed, float noiseOctaves, float lacunarity, float persistence,
+	float warpStrength,
+	float crackThreshold, float crackSharpness, float glowStrength,
+	float emberScale, float emberSpeed, float emberAmount,
+	float stoneScale, float stoneAmount, float thinCrackScale, float thinCrackDepth, float veinGlow,
+	float3 colorRock, float3 colorEmber, float3 colorHot, float3 colorCore,
+	float roughRock, float roughHot)
+{
+	LS_NoiseParams np = LiquidSim_MakeNoise(noiseSize, noiseSpeed, noiseSeed,
+	                                        2.0, noiseOctaves, lacunarity, persistence);
+	float tap = 0.006;
+
+	float hC = LS_HeightLava(uv, time, np, warpStrength, stoneScale, stoneAmount,
+	                         thinCrackScale, thinCrackDepth, crackThreshold);
+	float hU = LS_HeightLava(uv + float2(tap, 0.0), time, np, warpStrength, stoneScale, stoneAmount,
+	                         thinCrackScale, thinCrackDepth, crackThreshold);
+	float hV = LS_HeightLava(uv + float2(0.0, tap), time, np, warpStrength, stoneScale, stoneAmount,
+	                         thinCrackScale, thinCrackDepth, crackThreshold);
+
+	float heat = LS_LavaHeat(uv, time, hC, np, crackThreshold, crackSharpness,
+	                         emberScale, emberSpeed, emberAmount, thinCrackScale, veinGlow);
+
+	return LS_ShadeLava(worldNormal, hC, hU, hV, amplitude, heat, time, uv,
+	                    colorRock, colorEmber, colorHot, colorCore,
+	                    glowStrength, roughRock, roughHot);
+}

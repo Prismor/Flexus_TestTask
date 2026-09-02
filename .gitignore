@@ -1,0 +1,44 @@
+# === Unreal Engine: генерований і кешований вміст ===
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# === Сторонні плагіни ===
+# Не версіонується - велика, окремо оновлювана залежність.
+Plugins/
+
+# === Референсні матеріали клієнта (важкі, не наші файли) ===
+Reference/
+
+# === Python ===
+__pycache__/
+*.pyc
+
+# === Службове ===
+.DS_Store
+Thumbs.db
+desktop.ini
+Shaders/Shadertoy/portfolio.html
+
+# Android build output: APK-и по 150+ МБ, у git їм не місце
+/Build/
+
+# APK і відео завеликі для git (ліміт GitHub — 100 МБ на файл);
+# вони прикріплені до GitHub Release замість репозиторію
+/Delivery/*.apk
+/Delivery/*.mp4
+
+# Кеш автозбережень Premiere - не робота, а бекапи редактора
+/Premier/Adobe Premiere Pro Auto-Save/
+
+# Особисті нотатки і портфоліо - не для клієнта
+/Documentation/Personal/

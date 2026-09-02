@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "Client Test Task",
+	"Description": "FLEXUS Graphic Programmer test task: chameleon/specular material, Perlin vertex displacement, render-target painting with decaying waves, combined 'boss' shader. HLSL library in /Shaders reachable from materials as /Project/*.ush.",
+	"Modules": [
+		{
+			"Name": "FlexusTestTask",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"AdditionalDependencies": [
+				"Engine"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		}
+	]
+}

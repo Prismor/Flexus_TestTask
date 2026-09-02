@@ -1,0 +1,1081 @@
+// =============================================================================
+//  LiquidSimCore - engine-agnostic shader library
+//
+//  PURE MATH ONLY. No engine API, no texture objects, no samplers, no
+//  platform intrinsics. Every function takes plain floats and returns plain
+//  floats, so the exact same text compiles as:
+//
+//    * Unreal HLSL  - included by LiquidSim.ush (Custom material nodes)
+//    * Unity  HLSL  - include directly from a Custom Function node / .shader
+//    * GLSL / Shadertoy - prepend the compat prelude (see
+//      Python/build_shadertoy.py, which generates the ready-made files in
+//      Shaders/Shadertoy/)
+//
+//  RULES that keep this file portable - respect them when editing:
+//    1. No "1.0f" literal suffixes  (GLSL ES rejects them)     -> write 1.0
+//    2. No "const" on locals        (GLSL ES needs const-init) -> plain vars
+//    3. No [unroll] / [loop] attributes, no sincos, no matrices
+//    4. No texture sampling - callers sample and pass floats in
+//    5. Cast ints explicitly: float(i), never rely on promotion
+//
+//  Author: Max Okhrimenko
+// =============================================================================
+
+#pragma once
+
+// =============================================================================
+//  1. PARAMETER BLOCKS
+//  Grouped so a shader passes one struct instead of a dozen loose floats.
+//  Every field maps 1:1 to a material-instance parameter of the same name.
+// =============================================================================
+
+// Fractal noise settings shared by every procedural height field.
+struct LS_NoiseParams
+{
+	float Size;         // spatial frequency: how many features across the UV
+	float Speed;        // animation speed (time drives the 3rd noise axis)
+	float Seed;         // domain offset - different seeds never correlate
+	float Type;         // 0 = value, 1 = gradient/Perlin, 2 = ridged
+	float Octaves;      // 1..6 fractal layers
+	float Lacunarity;   // frequency multiplier per octave (classic: 2.0)
+	float Persistence;  // amplitude multiplier per octave (classic: 0.5)
+};
+
+// One brush stamp of the interactive paint pass (LVL 3/4/5).
+struct LS_BrushParams
+{
+	float2 Pos;         // cursor UV this frame
+	float2 PrevPos;     // cursor UV last frame - the stamp is a capsule
+	float Radius;       // stamp radius in UV space
+	float Softness;     // gaussian falloff width multiplier (higher = softer)
+	float Depth;        // press-down RATE, units per second
+	float RimHeight;    // raised ring RATE, units per second
+	float RimOffset;    // ring centre distance, in Radius units
+	float RimWidth;     // ring thickness, in Radius units
+	float Raggedness;   // 0 = clean round edge, 1 = torn noisy edge
+	float Strength;     // 1 while painting, 0 otherwise
+};
+
+// Per-texel simulation settings of the paint pass.
+struct LS_SimParams
+{
+	float Decay;          // per-frame damping (1 = never fades)
+	float DecayVariation; // spatial jitter of Decay - uneven, organic fade
+	float Viscosity;      // laplacian coupling = wave propagation speed
+	float SpringDamp;     // extra velocity-only damping (kills overshoot)
+	float VelocityMax;    // velocity clamp (kills spikes)
+	float Smoothing;      // blend toward neighbour average (rounds edges)
+	float WetnessDecay;   // how long painted COLOUR lingers
+	float MaxHeight;      // soft height limit
+	float DeltaTime;      // real frame time - makes rates framerate-independent
+};
+
+// Distance (in UV) at which the caller should sample the four neighbours.
+// Deliberately UV-based, not texel-based: the laplacian's strength depends on
+// how far the taps sit relative to the BRUSH size, so a texel-based tap would
+// make the same settings behave differently at every render-target
+// resolution. Never smaller than one texel, or the taps alias.
+float LS_WaveTapDistance(float texelSize, float waveTapUV)
+{
+	return max(texelSize, waveTapUV);
+}
+
+// What a displaced surface hands back to the material pins.
+struct LS_Surface
+{
+	float3 Offset;    // World Position Offset (along the surface normal)
+	float3 Normal;    // normal recalculated for the displaced shape
+	float3 BaseColor;
+	float3 Emissive;
+	float  Roughness;
+};
+
+// =============================================================================
+//  2. NOISE PRIMITIVES
+// =============================================================================
+
+// Hash helpers (Dave Hoskins style): cheap pseudo-random from a position.
+// No textures and no sin() - so no visible periodicity or platform drift.
+float LS_Hash31(float3 p)
+{
+	p = frac(p * 0.1031);
+	p += dot(p, p.zyx + 31.32);
+	return frac((p.x + p.y) * p.z);
+}
+
+float3 LS_Hash33(float3 p)
+{
+	p = frac(p * float3(0.1031, 0.1030, 0.0973));
+	p += dot(p, p.yxz + 33.33);
+	return frac((p.xxy + p.yxx) * p.zyx);
+}
+
+// Value noise: random value per lattice corner, smoothly interpolated. [-1,1]
+float LS_ValueNoise(float3 p)
+{
+	float3 i = floor(p);
+	float3 f = frac(p);
+	float3 u = f * f * (3.0 - 2.0 * f); // smoothstep weights
+
+	float c000 = LS_Hash31(i + float3(0.0, 0.0, 0.0));
+	float c100 = LS_Hash31(i + float3(1.0, 0.0, 0.0));
+	float c010 = LS_Hash31(i + float3(0.0, 1.0, 0.0));
+	float c110 = LS_Hash31(i + float3(1.0, 1.0, 0.0));
+	float c001 = LS_Hash31(i + float3(0.0, 0.0, 1.0));
+	float c101 = LS_Hash31(i + float3(1.0, 0.0, 1.0));
+	float c011 = LS_Hash31(i + float3(0.0, 1.0, 1.0));
+	float c111 = LS_Hash31(i + float3(1.0, 1.0, 1.0));
+
+	float n = lerp(
+		lerp(lerp(c000, c100, u.x), lerp(c010, c110, u.x), u.y),
+		lerp(lerp(c001, c101, u.x), lerp(c011, c111, u.x), u.y),
+		u.z);
+	return n * 2.0 - 1.0;
+}
+
+// Gradient noise - the classic Perlin construction: a random gradient vector
+// per lattice corner, dotted with the offset to the sample point. Smoother
+// and less blobby than value noise; this is the project's "Perlin".
+float LS_GradientNoise(float3 p)
+{
+	float3 i = floor(p);
+	float3 f = frac(p);
+	float3 u = f * f * (3.0 - 2.0 * f);
+
+	float g000 = dot(LS_Hash33(i + float3(0.0, 0.0, 0.0)) * 2.0 - 1.0, f - float3(0.0, 0.0, 0.0));
+	float g100 = dot(LS_Hash33(i + float3(1.0, 0.0, 0.0)) * 2.0 - 1.0, f - float3(1.0, 0.0, 0.0));
+	float g010 = dot(LS_Hash33(i + float3(0.0, 1.0, 0.0)) * 2.0 - 1.0, f - float3(0.0, 1.0, 0.0));
+	float g110 = dot(LS_Hash33(i + float3(1.0, 1.0, 0.0)) * 2.0 - 1.0, f - float3(1.0, 1.0, 0.0));
+	float g001 = dot(LS_Hash33(i + float3(0.0, 0.0, 1.0)) * 2.0 - 1.0, f - float3(0.0, 0.0, 1.0));
+	float g101 = dot(LS_Hash33(i + float3(1.0, 0.0, 1.0)) * 2.0 - 1.0, f - float3(1.0, 0.0, 1.0));
+	float g011 = dot(LS_Hash33(i + float3(0.0, 1.0, 1.0)) * 2.0 - 1.0, f - float3(0.0, 1.0, 1.0));
+	float g111 = dot(LS_Hash33(i + float3(1.0, 1.0, 1.0)) * 2.0 - 1.0, f - float3(1.0, 1.0, 1.0));
+
+	float n = lerp(
+		lerp(lerp(g000, g100, u.x), lerp(g010, g110, u.x), u.y),
+		lerp(lerp(g001, g101, u.x), lerp(g011, g111, u.x), u.y),
+		u.z);
+	return n * 1.4; // raw range is about [-0.7,0.7] - stretch toward [-1,1]
+}
+
+// Fractal Brownian Motion: sum octaves of noise, each smaller and finer.
+// Type 2 (ridged) mirrors each octave around zero to make sharp creases -
+// that is what gives lava plates and the vortex their torn look.
+float LS_FBM(float3 p, LS_NoiseParams np)
+{
+	p += np.Seed * 57.31;
+
+	float sum = 0.0;
+	float amp = 1.0;
+	float ampTotal = 0.0;
+	float3 sp = p;
+
+	int octaves = int(clamp(np.Octaves, 1.0, 6.0));
+
+	for (int i = 0; i < 6; ++i)
+	{
+		if (i >= octaves) { break; }
+
+		float n = (np.Type < 0.5) ? LS_ValueNoise(sp) : LS_GradientNoise(sp);
+		if (np.Type > 1.5) { n = 1.0 - 2.0 * abs(n); } // ridged
+
+		sum += n * amp;
+		ampTotal += amp;
+		amp *= np.Persistence;
+		sp *= np.Lacunarity;
+	}
+
+	return sum / max(ampTotal, 0.0001); // normalised to roughly [-1,1]
+}
+
+// Voronoi F1: distance to the nearest of a scattered point set. Used for
+// the cobblestone bumps on the lava crust.
+float LS_Voronoi(float2 p)
+{
+	float2 i = floor(p);
+	float2 f = frac(p);
+	float dmin = 8.0;
+
+	for (int y = -1; y <= 1; ++y)
+	{
+		for (int x = -1; x <= 1; ++x)
+		{
+			float2 g = float2(float(x), float(y));
+			float2 o = LS_Hash33(float3(i + g, 0.0)).xy;
+			float2 r = g + o - f;
+			dmin = min(dmin, dot(r, r));
+		}
+	}
+	return sqrt(dmin);
+}
+
+// =============================================================================
+//  3. COLOUR HELPERS
+// =============================================================================
+
+// 3-stop gradient by a normalised value t (0 = lowest, 1 = highest).
+// Wide overlapping crossfades - the two halves never show a seam.
+float3 LS_HeightRamp(float t, float3 low, float3 mid, float3 high)
+{
+	float3 a = lerp(low, mid, smoothstep(0.0, 0.65, t));
+	float3 b = lerp(mid, high, smoothstep(0.35, 1.0, t));
+	return lerp(a, b, smoothstep(0.3, 0.7, t));
+}
+
+// View-angle driven 3-colour shift: a simplified stand-in for thin-film
+// interference. Grazing angles show colour A, head-on shows colour C.
+// Shift > 1 shrinks the head-on band and widens the grazing ones.
+float3 LS_Iridescent(float3 normal, float3 viewDir, float3 a, float3 b, float3 c, float shift)
+{
+	float ndotv = pow(saturate(dot(normalize(normal), normalize(viewDir))), max(shift, 0.1));
+	float3 low  = lerp(a, b, smoothstep(0.0, 0.55, ndotv));
+	float3 high = lerp(b, c, smoothstep(0.45, 1.0, ndotv));
+	return lerp(low, high, smoothstep(0.45, 0.55, ndotv));
+}
+
+// View-dependent procedural glitter: a sparse subset of hash cells lights up
+// and twinkles - reads as sparkle particles without any particle system.
+float LS_Sparkle(float2 uv, float3 normal, float3 viewDir, float time, float scale, float density)
+{
+	float2 cell = floor(uv * scale);
+	float h = LS_Hash31(float3(cell, 7.0));
+
+	float gate = step(1.0 - density, h);                       // only rare cells
+	float twinkle = 0.5 + 0.5 * sin(time * 3.0 + h * 251.0);   // own phase each
+	float view = pow(saturate(dot(normalize(normal), normalize(viewDir))), 2.0);
+	return gate * twinkle * view;
+}
+
+// =============================================================================
+//  4. SURFACE RECONSTRUCTION
+// =============================================================================
+
+// Central differences: the engine has no idea a vertex shader moved the mesh,
+// so lighting would keep using the flat original normal. Sampling the SAME
+// height function at the point and at two small taps gives two edge vectors
+// whose cross product is the true displaced normal.
+//
+// Heights arrive already scaled to world units (cm). Tangent/bitangent are
+// the constant world X/Y axes - exact for this project's flat, axis-aligned
+// planes and free of any per-vertex tangent basis.
+
+// Central differences: cross the edge vectors from two nearby height taps to get the
+// true displaced normal (the engine's own normal still thinks the surface is flat).
+void LS_SurfaceFromHeights(float3 worldNormal, float hCenter, float hTapU, float hTapV,
+                           out float3 outOffset, out float3 outNormal)
+{
+	float tapDistance = 5.0; // cm between taps in world space
+
+	float3 n = normalize(worldNormal);
+	float3 t = float3(1.0, 0.0, 0.0);
+	float3 b = float3(0.0, 1.0, 0.0);
+
+	float3 posC = n * hCenter;
+	float3 posU = t * tapDistance + n * hTapU;
+	float3 posV = b * tapDistance + n * hTapV;
+
+	outOffset = posC;
+	outNormal = normalize(cross(posV - posC, posU - posC));
+
+	// cross() can point either way depending on handedness - keep it in the
+	// same hemisphere as the original normal, or a flat surface lights up
+	// from behind.
+	if (dot(outNormal, n) < 0.0) { outNormal = -outNormal; }
+}
+
+// =============================================================================
+//  5. PROCEDURAL HEIGHT FIELDS
+//  Each returns a raw height in roughly [-1,1]; callers scale by amplitude.
+// =============================================================================
+
+// ---- LVL 2: animated Perlin displacement -----------------------------------
+// Time rides the third noise axis, so the field MORPHS instead of merely
+// scrolling past - the difference between "moving fabric" and "living gel".
+float LS_HeightPerlin(float2 uv, float time, LS_NoiseParams np)
+{
+	return LS_FBM(float3(uv * np.Size, time * np.Speed), np);
+}
+
+// ---- LVL 6: vortex ---------------------------------------------------------
+// Three stacked ideas: (1) rotate the sampling domain by an angle that grows
+// toward the centre, so the noise winds into a whirlpool; (2) domain-warp it
+// with a second noise (fbm(p + fbm(p))) for organic tendrils; (3) subtract a
+// smooth funnel so the middle sinks.
+float LS_HeightVortex(float2 uv, float time, LS_NoiseParams np,
+                      float swirlStrength, float swirlTightness, float swirlSpeed,
+                      float warpStrength, float funnelDepth, float funnelTightness)
+{
+	float2 c = uv - 0.5;
+	float r = length(c);
+
+	float angle = swirlStrength * exp(-r * swirlTightness) + time * swirlSpeed;
+	float sa = sin(angle);
+	float ca = cos(angle);
+	float2 swirled = float2(c.x * ca - c.y * sa, c.x * sa + c.y * ca) + 0.5;
+
+	float3 p = float3(swirled * np.Size, time * np.Speed);
+
+	LS_NoiseParams warpNp = np;
+	warpNp.Seed = np.Seed + 9.0;
+	warpNp.Type = 1.0;
+	warpNp.Octaves = 2.0;
+	float warp = LS_FBM(p + 3.7, warpNp);
+
+	float noise = LS_FBM(p + warp * warpStrength, np);
+
+	// close to the core the rotation stretches the noise lattice into visible
+	// repeated streaks - fade it out there, the funnel carries that region
+	float noiseFade = smoothstep(0.0, 0.12, r);
+
+	// Two-lobe funnel: a wide shallow basin plus a narrow deep throat. A single
+	// gaussian is either a soft dish with no throat or, once it is deep enough
+	// to read as a vortex, so steep at the rim that it folds triangles on the
+	// coarse 100x100 plane. Splitting it puts the depth in the middle where
+	// there is no geometry to fold.
+	float basin = exp(-r * r * funnelTightness * 0.30);
+	float throat = exp(-r * r * funnelTightness * 3.20);
+	float funnel = -funnelDepth * (0.42 * basin + 0.58 * throat);
+
+	// NOTE: an earlier version cut spiral rifling into the funnel wall with
+	// sin(atan2(...) * 5 - r * 34). Removed: on the coarse 100x100 grid those
+	// high-frequency grooves produced a hard dark seam down one side, because
+	// the wall slope flipped between two adjacent vertices. The swirl already
+	// carries the rotation, so the grooves were not worth the artefact.
+
+	// The basin lobe is still ~20% deep at the plane border, which sinks the
+	// whole vortex plane below its neighbours. max(|x|,|y|) is the Chebyshev
+	// distance, so the fade follows the SQUARE edge of the plane and reaches
+	// zero on all four sides and in the corners alike.
+	// Starts at 0.40, not 0.30: the wide basin lobe does most of its work
+	// between 0.15 and 0.35, and fading from 0.30 erased nearly the whole
+	// funnel - the surface came out almost flat.
+	funnel *= 1.0 - smoothstep(0.40, 0.50, max(abs(c.x), abs(c.y)));
+
+	return noise * noiseFade + funnel;
+}
+
+// ---- LVL 7: rain -----------------------------------------------------------
+// Three offset grids of cells; each cell spawns one drop at a random position,
+// phase and size. A drop is a cosine ring travelling outward, damped by age.
+// The drop sits well inside its cell and a border fade forces the ring to
+// zero before the cell edge, so no grid seams appear.
+
+// Three offset grids so drops don't visibly repeat on a lattice; each cell's hashed
+// rnd/phase decides its one drop's position, size and timing - age = frac(time*rate + phase) loops it forever.
+float LS_HeightRain(float2 uv, float time,
+                    float dropRate, float ringSpeed, float ringWidth, float ringFrequency,
+                    float dropDensity, float sizeVariation)
+{
+	float h = 0.0;
+
+	for (int k = 0; k < 3; ++k)
+	{
+		float fk = float(k);
+		float2 gridUV = uv * (6.0 + fk * 5.0) + fk * 17.31;
+		float2 cell = floor(gridUV);
+		float2 f = frac(gridUV);
+
+		float3 seed = float3(cell, fk * 13.7);
+		float3 rnd = LS_Hash33(seed);
+		float2 dropPos = rnd.xy * 0.4 + 0.3;
+		float phase = LS_Hash31(seed + 5.0);
+
+		float alive = step(1.0 - dropDensity, LS_Hash31(seed + 11.0));
+		float sizeMul = lerp(1.0 - sizeVariation * 0.6, 1.0 + sizeVariation, rnd.z);
+
+		float age = frac(time * dropRate * lerp(0.8, 1.3, rnd.z) + phase);
+		float dist = length(f - dropPos);
+		float ringR = age * ringSpeed * sizeMul;
+
+		float envelope = exp(-pow((dist - ringR) / max(ringWidth * sizeMul, 0.0001), 2.0));
+		float borderFade = 1.0 - smoothstep(0.30, 0.45, dist);
+
+		h += cos((dist - ringR) * ringFrequency) * envelope * borderFade
+		   * (1.0 - age) * (1.0 - age) * alive * sizeMul;
+	}
+
+	return h / 3.0;
+}
+
+// ---- LVL 8: lava -----------------------------------------------------------
+// Warped ridged FBM makes big winding plates; on the cool crust only, voronoi
+// cobblestones bump up and thin ridged grooves cut down. Detail is masked out
+// of the molten rivers so they stay smooth and liquid.
+float LS_HeightLava(float2 uv, float time, LS_NoiseParams np, float warpStrength,
+                    float stoneScale, float stoneAmount,
+                    float thinCrackScale, float thinCrackDepth, float crackThreshold)
+{
+	// The crust ADVECTS: the whole plate field slides along a direction while
+	// its warp field slides slower. Scrolling a static pattern uniformly reads
+	// as a moving texture; two layers at different rates read as flow, because
+	// the plates deform as they travel.
+	float2 drift = float2(0.06, 0.021) * time * np.Speed;
+	float3 p = float3((uv + drift) * np.Size, time * np.Speed * 0.35);
+
+	// A second, slower-moving noise bends the sample point before the plate
+	// field reads it - domain warp, so the plate edges curl instead of tiling.
+	LS_NoiseParams warpNp = np;
+	warpNp.Seed = np.Seed + 4.0;
+	warpNp.Type = 1.0;
+	warpNp.Octaves = 2.0;
+	float warp = LS_FBM(p * 0.5 + 7.3, warpNp);
+
+	float plates = LS_FBM(p + warp * warpStrength, np);
+
+	// Only where a plate boundary runs hot (plates >= crackThreshold) do the
+	// detail terms below get to touch the height at all.
+	float crustMask = smoothstep(crackThreshold, crackThreshold + 0.3, plates);
+
+	// Voronoi cells bump the crust up - cobblestone, not cracks.
+	float stones = smoothstep(0.45, 0.05, LS_Voronoi(uv * stoneScale)) * stoneAmount;
+
+	// A separate, independent noise field for the thin surface grooves - see
+	// LS_LavaHeat for why this can't be the same field as the plates.
+	LS_NoiseParams thinNp = np;
+	thinNp.Seed = np.Seed + 23.0;
+	thinNp.Type = 2.0;
+	thinNp.Octaves = 2.0;
+	float thin = LS_FBM(float3(uv * thinCrackScale, 2.7), thinNp);
+	float groove = smoothstep(0.45, 0.75, thin) * thinCrackDepth;
+
+	return plates + (stones - groove) * crustMask;
+}
+
+// Heat field of the lava crust, shared by height detail and shading.
+float LS_LavaHeat(float2 uv, float time, float plateHeight, LS_NoiseParams np,
+                  float crackThreshold, float crackSharpness,
+                  float emberScale, float emberSpeed, float emberAmount,
+                  float thinCrackScale, float veinGlow)
+{
+	// THE CRACK NETWORK. This is where the look comes from, so it is built
+	// first and everything else only modulates it.
+	//
+	// A ridged field is 1 - 2*|noise|, so its crest lies exactly on the zero
+	// crossing of the underlying noise - a LINE. Taking the crest with a narrow
+	// band therefore yields thin channels. Two octaves only: summing more
+	// smooths the crest into a blob, which is exactly why deriving the heat
+	// from the multi-octave plate field could never produce a crack no matter
+	// how the threshold was tuned.
+	LS_NoiseParams crackNp = np;
+	crackNp.Seed = np.Seed + 23.0;
+	crackNp.Type = 2.0;
+	crackNp.Octaves = 2.0;
+
+	// The network drifts with the crust instead of sitting still on it.
+	float2 crackUV = uv + float2(0.06, 0.021) * time * np.Speed;
+	float thin = LS_FBM(float3(crackUV * thinCrackScale, 2.7), crackNp);
+
+	// A RIFT, not a stripe. Three nested zones give the gradient:
+	//   shoulder - a broad warm slope where the rock is merely hot
+	//   flank    - the visible crack, ramping up
+	//   core     - a narrow molten centre
+	// A single hard band produced exactly what it sounds like: bright stripes
+	// pasted onto grey stone with no transition between the two.
+	float width = 1.0 / max(crackSharpness, 0.001);
+
+	float shoulder = smoothstep(crackThreshold - width * 2.6, crackThreshold - width * 0.4, thin);
+	float flank    = smoothstep(crackThreshold - width * 0.9, crackThreshold + width * 0.5, thin);
+	float core     = smoothstep(crackThreshold + width * 0.2, crackThreshold + width * 0.9, thin);
+
+	// Weighted so the eye reads a slope into the crack rather than an edge:
+	// most of the area is shoulder, and only the very middle is molten.
+	float heat = saturate(shoulder * 0.30 + flank * 0.45 + core * 0.55);
+
+	// The plate field only says WHERE the crust is thinner, so the network
+	// glows a little harder in the hollows. It is a modulator now, not the
+	// source - as the source it could only ever make lakes.
+	heat *= 0.75 + 0.25 * saturate(1.0 - plateHeight);
+
+	// Embers MULTIPLY the existing heat instead of adding to it. The additive
+	// form raised the floor everywhere, so no part of the surface was ever cold
+	// and the whole plane read as one orange mush.
+	LS_NoiseParams emberNp = np;
+	emberNp.Seed = np.Seed + 11.0;
+	emberNp.Type = 1.0;
+	emberNp.Octaves = 2.0;
+	emberNp.Size = 1.0;
+	float ember = LS_FBM(float3(uv * emberScale, time * emberSpeed), emberNp) * 0.5 + 0.5;
+	heat = saturate(heat * (1.0 + ember * emberAmount));
+
+	// veinGlow brightens the very centre of a channel, keeping the hottest
+	// pixels a thin line inside an already thin crack.
+	float spine = smoothstep(crackThreshold + width * 0.5, crackThreshold + width, thin);
+	return saturate(heat + spine * veinGlow);
+}
+
+// =============================================================================
+//  6. INTERACTIVE PAINT SIMULATION (LVL 3/4/5)
+//
+//  State lives in one RGBA render target, ping-ponged every frame:
+//      R = height, G = vertical velocity, B = wetness (paint coverage)
+//
+//  The caller samples the previous frame (centre + 4 neighbours) and passes
+//  the values in - that keeps this function free of texture objects and so
+//  identical across engines.
+// =============================================================================
+float3 LS_PaintStep(float3 prevHVW, float neighbourAvgH, float2 uv,
+                    LS_BrushParams brush, LS_SimParams sim)
+{
+	float h = prevHVW.r;
+	float v = prevHVW.g;
+	float w = prevHVW.b;
+
+	// --- viscous relaxation: round off edges left by fast strokes ---------
+	h = lerp(h, neighbourAvgH, saturate(sim.Smoothing));
+
+	// --- propagating wave --------------------------------------------------
+	// The restoring force is the laplacian (neighbour average minus self), so
+	// a disturbance actually SPREADS outward in rings rather than bobbing in
+	// place. Viscosity is the coupling strength = wave speed.
+	// A static spatial jitter on the damping makes the fade slightly uneven.
+	float jitter = LS_ValueNoise(float3(uv * 9.0, 3.0)) * sim.DecayVariation;
+	float decay = saturate(sim.Decay - abs(jitter));
+
+	// Stability ceiling. This is an explicit integration of a wave equation,
+	// so the coupling has a CFL-style limit: measured on a ping-pong buffer,
+	// 2.0 still loses ~99% of its energy over 500 frames while 2.5 GAINS
+	// energy and never settles. Clamping here means a user cannot blow the
+	// simulation up from a material instance.
+	float viscosity = min(sim.Viscosity, 2.0);
+
+	v = (v + (neighbourAvgH - h) * viscosity) * decay * saturate(sim.SpringDamp);
+	v = clamp(v, -sim.VelocityMax, sim.VelocityMax); // no overshoot spikes
+	h = (h + v) * decay;
+
+	// ABSORBING BORDER.
+	//
+	// Clamped sampling stops a wave leaving through one edge and re-entering
+	// through the opposite one, but it replaces that with a hard REFLECTION:
+	// the border acts as a wall, the wave bounces and travels back across the
+	// surface, which looks just as wrong - as though it had come round the
+	// other side.
+	//
+	// So the outer band of the surface bleeds energy instead. Height and
+	// velocity are both scaled down towards the rim, so a wave arriving there
+	// simply dies out. edge is 1 in the middle and falls to 0 at the border;
+	// max(|x|,|y|) makes the band follow the SQUARE outline of the plane, so
+	// the corners damp exactly like the sides.
+	// Named edgeDist, not rim: this function already has a "rim" - the gaussian
+	// ring of displaced material around the brush - and reusing the name is a
+	// redefinition error, not a shadow.
+	float2 fromCentre = abs(uv - 0.5) * 2.0;
+	float edgeDist = max(fromCentre.x, fromCentre.y);
+	float edge = 1.0 - smoothstep(0.82, 1.0, edgeDist);
+	v *= edge;
+	h *= edge;
+
+	// --- brush stamp: a CAPSULE, not a circle ------------------------------
+	// Distance to the segment between last frame's and this frame's cursor,
+	// so a fast stroke paints a continuous line instead of separate blobs.
+	float2 seg = brush.Pos - brush.PrevPos;
+	float segLen2 = dot(seg, seg);
+	float segT = (segLen2 > 0.00000001) ? saturate(dot(uv - brush.PrevPos, seg) / segLen2) : 0.0;
+	float dist = length(uv - (brush.PrevPos + seg * segT));
+
+	// gaussian dent, optionally torn at the border by high-frequency noise
+	float tear = 0.5 + 0.5 * LS_ValueNoise(float3(uv * 55.0, 1.0));
+	float dent = exp(-(dist * dist) / max(brush.Radius * brush.Radius * brush.Softness, 0.000001));
+	dent *= lerp(1.0, tear, saturate(brush.Raggedness));
+
+	// gaussian ring just outside the dent - displaced material piling up
+	float rimD = (dist - brush.Radius * brush.RimOffset) / max(brush.Radius * brush.RimWidth, 0.0001);
+	float rim = exp(-rimD * rimD);
+
+	// Depth/RimHeight are RATES: scaling by DeltaTime presses the surface
+	// down gradually in layers and keeps the feel framerate-independent.
+	h += (-brush.Depth * dent + brush.RimHeight * rim) * brush.Strength * sim.DeltaTime;
+	w = saturate(w * saturate(sim.WetnessDecay) + dent * brush.Strength * 2.5 * sim.DeltaTime);
+
+	// --- knee-compressed limit --------------------------------------------
+	// A plain tanh applied every frame would slowly melt ALL accumulated
+	// height away. Below the knee the height passes through untouched; only
+	// the top of the range is softly compressed, so there is no flat floor
+	// and nothing decays that should not.
+	float knee = sim.MaxHeight * 0.7;
+	float range = max(sim.MaxHeight - knee, 0.0001);
+	float mag = abs(h);
+	if (mag > knee)
+	{
+		h = sign(h) * (knee + range * tanh((mag - knee) / range));
+	}
+
+	return float3(h, v, w);
+}
+
+// =============================================================================
+//  7. SHADING MODELS
+//  Each takes already-sampled heights and returns a filled LS_Surface.
+// =============================================================================
+
+// ---- LVL 1: chameleon ------------------------------------------------------
+// Iridescent colour, per-band roughness (each colour zone gets its own
+// finish), and a Fresnel-weighted reflection. The cubemap itself cannot live
+// here (it is a texture), so the caller samples it and passes the colour in;
+// pass float3(0,0,0) for a purely analytic look.
+LS_Surface LS_ShadeChameleon(float3 worldNormal, float3 viewDir,
+                             float3 colorA, float3 colorB, float3 colorC,
+                             float roughA, float roughB, float roughC,
+                             float3 reflectionColor, float3 highlightColor,
+                             float reflectivity, float gradientBoost,
+                             float fresnelPower, float gradientShift)
+{
+	float3 n = normalize(worldNormal);
+	float3 v = normalize(viewDir);
+	float ndotv = pow(saturate(dot(n, v)), max(gradientShift, 0.1));
+
+	// same banding curve for roughness as for colour
+	float roughLow  = lerp(roughA, roughB, smoothstep(0.0, 0.55, ndotv));
+	float roughHigh = lerp(roughB, roughC, smoothstep(0.45, 1.0, ndotv));
+
+	float3 colLow  = lerp(colorA, colorB, smoothstep(0.0, 0.55, ndotv));
+	float3 colHigh = lerp(colorB, colorC, smoothstep(0.45, 1.0, ndotv));
+
+	LS_Surface s;
+	s.Offset = float3(0.0, 0.0, 0.0);
+	s.Normal = n;
+	s.Roughness = lerp(roughLow, roughHigh, smoothstep(0.45, 0.55, ndotv));
+	s.BaseColor = lerp(colLow, colHigh, smoothstep(0.45, 0.55, ndotv));
+
+	// Fresnel: reflections belong at grazing angles. GradientBoost re-adds a
+	// little of the ramp as emissive so the colour shift stays readable even
+	// when metallic shading would otherwise swallow it.
+	float fresnel = pow(1.0 - ndotv, max(fresnelPower, 0.1));
+	s.Emissive = reflectionColor * highlightColor * fresnel * reflectivity
+	           + s.BaseColor * gradientBoost;
+	return s;
+}
+
+// ---- LVL 2: displaced noise surface ----------------------------------------
+LS_Surface LS_ShadeDisplacement(float3 worldNormal, float hC, float hU, float hV,
+                                float amplitude, float3 low, float3 mid, float3 high,
+                                float roughness)
+{
+	LS_Surface s;
+	LS_SurfaceFromHeights(worldNormal, hC * amplitude, hU * amplitude, hV * amplitude,
+	                      s.Offset, s.Normal);
+	s.BaseColor = LS_HeightRamp(saturate(hC * 0.5 + 0.5), low, mid, high);
+	s.Emissive = float3(0.0, 0.0, 0.0);
+	s.Roughness = roughness;
+	return s;
+}
+
+// ---- LVL 3/4: painted surface ----------------------------------------------
+// Colour comes from the WETNESS channel, not from |height|: coverage is then
+// solid and gradient-smooth, with no uncoloured bands where the height
+// happens to cross zero. Height drives the ramp inside the wet area.
+
+// wet (from the wetness channel) gates HOW MUCH colour shows; rampT (from height) picks
+// WHICH colour - coverage stays solid even where height crosses zero.
+LS_Surface LS_ShadePainted(float3 worldNormal, float hC, float hU, float hV, float wetness,
+                           float amplitude, float3 baseColor,
+                           float3 low, float3 mid, float3 high,
+                           float heightColorScale, float wetSensitivity,
+                           float roughnessDry, float roughnessWet)
+{
+	LS_Surface s;
+	LS_SurfaceFromHeights(worldNormal, hC * amplitude, hU * amplitude, hV * amplitude,
+	                      s.Offset, s.Normal);
+
+	float wet = saturate(wetness * wetSensitivity);
+	float rampT = saturate(hC * heightColorScale * 0.5 + 0.5);
+
+	s.BaseColor = lerp(baseColor, LS_HeightRamp(rampT, low, mid, high), wet);
+	s.Emissive = float3(0.0, 0.0, 0.0);
+	s.Roughness = lerp(roughnessDry, roughnessWet, wet);
+	return s;
+}
+
+// ---- LVL 5: boss -----------------------------------------------------------
+// Noise displacement and painted displacement are combined PER TAP and the
+// normal rebuilt once from the sums, so the two effects merge into one
+// surface rather than two stacked ones.
+void LS_BossDisplace(float3 worldNormal,
+                     float noiseC, float noiseU, float noiseV, float noiseAmplitude,
+                     float paintC, float paintU, float paintV, float paintAmplitude,
+                     out float3 outOffset, out float3 outNormal)
+{
+	LS_SurfaceFromHeights(worldNormal,
+		noiseC * noiseAmplitude + paintC * paintAmplitude,
+		noiseU * noiseAmplitude + paintU * paintAmplitude,
+		noiseV * noiseAmplitude + paintV * paintAmplitude,
+		outOffset, outNormal);
+}
+
+// Near-black idle base breathing with the noise; iridescent fluid wherever
+// paint is active; a hot core inside the stroke; a dithered tint on the
+// coverage boundary; foam on crests; glitter. This is the level's
+// "colour reacts to wave movement" requirement.
+
+// activity = wetness*activitySensitivity is the one value everything below keys off -
+// dormant base fades in as it rises, so colour tracks the paint's own movement.
+LS_Surface LS_ShadeBoss(float3 displacedNormal, float3 viewDir, float2 uv, float time,
+                        float paintHeight, float noiseHeight, float wetness,
+                        float3 baseDark, float3 colorA, float3 colorB, float3 colorC,
+                        float3 troughColor, float3 edgeColor, float3 foamColor,
+                        float activitySensitivity, float troughSensitivity,
+                        float troughGlow, float interiorGlow, float edgeDither,
+                        float foamIntensity, float idleBreathing,
+                        float roughIdle, float roughActive,
+                        float sparkleScale, float sparkleIntensity)
+{
+	float activity = saturate(wetness * activitySensitivity);
+	float troughT = saturate(-paintHeight * troughSensitivity);
+
+	float3 iridescent = LS_Iridescent(displacedNormal, viewDir, colorA, colorB, colorC, 1.0);
+	float3 fluid = lerp(iridescent, troughColor, troughT);
+	float3 idle = baseDark * (1.0 + noiseHeight * idleBreathing);
+
+	LS_Surface s;
+	s.Offset = float3(0.0, 0.0, 0.0); // displacement handled by LS_BossDisplace
+	s.Normal = displacedNormal;
+	s.BaseColor = lerp(idle, fluid, activity);
+
+	// noise-dithered tint exactly on the coverage boundary
+	float edgeBand = smoothstep(0.03, 0.2, activity) * (1.0 - smoothstep(0.35, 0.7, activity));
+	float dither = step(0.5, LS_Hash31(float3(uv * 900.0, 1.0)));
+	s.BaseColor = lerp(s.BaseColor, edgeColor, edgeBand * dither * saturate(edgeDither));
+
+	float ndotv = saturate(dot(normalize(displacedNormal), normalize(viewDir)));
+	float rim = pow(1.0 - ndotv, 3.0) * activity;
+	float sparkle = LS_Sparkle(uv, displacedNormal, viewDir, time,
+	                           sparkleScale, 0.015 + activity * 0.03);
+
+	s.Emissive = troughColor * (troughT * troughT) * troughGlow
+	           + troughColor * pow(saturate(wetness), 3.0) * interiorGlow
+	           + foamColor * rim * foamIntensity
+	           + foamColor * sparkle * sparkleIntensity * (0.3 + activity);
+	s.Roughness = lerp(roughIdle, roughActive, activity);
+	return s;
+}
+
+// ---- LVL 6: vortex ---------------------------------------------------------
+
+// Colour is sampled on the SAME rotated/swirled coordinates the height field uses
+// (see LS_HeightVortex), so the bands wind and drift with the geometry, not the camera.
+LS_Surface LS_ShadeVortex(float3 displacedNormal, float3 viewDir, float2 uv, float time,
+                          float centreDist,
+                          float3 colorA, float3 colorB, float3 colorC,
+                          float3 coreColor, float3 foamColor,
+                          float coreGlow, float coreTightness,
+                          float pulseSpeed, float pulseAmount,
+                          float roughIdle, float roughActive,
+                          float sparkleScale, float sparkleIntensity,
+                          float bandArms, float bandTwist, float bandNoiseScale,
+                          float bandNoiseAmount, float bandContrast,
+                          LS_NoiseParams np, float swirlStrength, float swirlTightness,
+                          float swirlSpeed)
+{
+	LS_Surface s;
+	s.Offset = float3(0.0, 0.0, 0.0);
+	s.Normal = displacedNormal;
+	// Colour follows the SWIRL, which is what the eye reads as a vortex.
+	//
+	// Two earlier attempts were wrong in opposite directions. The original
+	// passed viewDir to LS_Iridescent, so the hue changed as the camera
+	// orbited - the surface behaved like a soap film. Replacing viewDir with a
+	// fixed axis fixed that but drained the colour instead: this is a nearly
+	// flat plate, so its normal points the same way almost everywhere and the
+	// ramp collapsed to a single tone.
+	//
+	// Here the ramp is driven by a spiral coordinate built from the angle
+	// around the centre and the distance to it, so the bands wind into the
+	// funnel and turn with it. sin() is used rather than the raw angle because
+	// atan2 jumps by 2*pi on one side, which would leave a seam.
+	float2 cc = uv - 0.5;
+	float r = length(cc);
+
+	// The colour rides the SAME swirl the geometry does. Earlier versions built
+	// the ramp from a pure sin() spiral, from the surface normal, or from the
+	// view direction - all of which either drifted with the camera or read as
+	// printed stripes. Rotating the sample coordinates by the same angle the
+	// height field uses means the colour bands are dragged around by the vortex
+	// itself, so they wind and smear exactly like the surface does.
+	float angle = swirlStrength * exp(-r * swirlTightness) + time * swirlSpeed;
+	float sa = sin(angle);
+	float ca = cos(angle);
+	float2 swirled = float2(cc.x * ca - cc.y * sa, cc.x * sa + cc.y * ca) + 0.5;
+
+	// Ridged noise on those swirled coordinates: its crests are thin LINES, and
+	// swirled coordinates make them curved lines that follow the rotation. That
+	// is the "many thin twisted streaks" the flat spiral could never produce.
+	LS_NoiseParams lineNp = np;
+	lineNp.Type = 2.0;
+	lineNp.Octaves = 3.0;
+	float lines = LS_FBM(float3(swirled * bandNoiseScale, time * 0.08), lineNp);
+
+	// A slow arm-count modulation keeps large-scale structure under the streaks.
+	float ang2 = atan2(cc.y, cc.x);
+	float arms = sin(ang2 * bandArms - r * bandTwist + time * pulseSpeed * 0.6);
+
+	// Streaks tighten toward the eye of the vortex: that radial pull is what
+	// makes it read as a portal rather than a flat swirl pattern.
+	float pull = 1.0 - smoothstep(0.0, 0.42, r);
+
+	// CENTRED on 0.5. The previous version added a flat +0.35 bias, which
+	// pushed almost every pixel into the top of the ramp - so the surface came
+	// out nearly all ColorC (aqua) and the violet end only survived on rare
+	// peaks. Centring the distribution lets all three colours appear.
+	// ridged FBM returns roughly 0..1, so it is remapped to -0.5..+0.5 first.
+	float band = 0.5
+	           + (lines - 0.5) * 0.85
+	           + arms * 0.20
+	           + pull * 0.18;
+	band = saturate(band + bandNoiseAmount * (lines - 0.5));
+
+	// Contrast sharpens the streaks into thin lines instead of soft washes.
+	band = saturate((band - 0.5) * bandContrast + 0.5);
+
+	float3 swirlCol = lerp(colorA, colorB, smoothstep(0.0, 0.5, band));
+	swirlCol = lerp(swirlCol, colorC, smoothstep(0.42, 1.0, band));
+
+	// A little genuine view dependence on top - a sheen, not the base colour.
+	float sheen = pow(1.0 - saturate(dot(normalize(displacedNormal), normalize(viewDir))), 4.0);
+	s.BaseColor = swirlCol * (1.0 + sheen * 0.35);
+
+	float pulse = 1.0 + pulseAmount * sin(time * pulseSpeed);
+	float core = exp(-centreDist * centreDist * coreTightness) * pulse;
+
+	float ndotv = saturate(dot(normalize(displacedNormal), normalize(viewDir)));
+	float rim = pow(1.0 - ndotv, 3.0) * core;
+	float sparkle = LS_Sparkle(uv, displacedNormal, viewDir, time, sparkleScale, 0.03);
+
+	s.Emissive = coreColor * core * coreGlow
+	           + foamColor * rim * 0.6
+	           + foamColor * sparkle * sparkleIntensity;
+	s.Roughness = lerp(roughIdle, roughActive, saturate(core));
+	return s;
+}
+
+// ---- LVL 8: lava -----------------------------------------------------------
+// Four-stop heat gradient: cold crust -> smouldering dark red -> orange ->
+// white-hot core, with the emissive following the same curve so the glow is
+// always the colour of the surface underneath it.
+LS_Surface LS_ShadeLava(float3 worldNormal, float hC, float hU, float hV, float amplitude,
+                        float heat, float time, float2 uv,
+                        float3 colorRock, float3 colorEmber, float3 colorHot, float3 colorCore,
+                        float glowStrength, float roughRock, float roughHot)
+{
+	LS_Surface s;
+	LS_SurfaceFromHeights(worldNormal, hC * amplitude, hU * amplitude, hV * amplitude,
+	                      s.Offset, s.Normal);
+
+	// Narrow, staggered bands rather than three wide overlapping lerps: wide
+	// ramps blend every colour into the same orange average. The rock band is
+	// also given room to stay rock - nothing warms until heat passes 0.12.
+	// Wider, overlapping bands. The narrow staggered version was introduced to
+	// stop everything averaging into one orange, but taken too far it produced
+	// hard colour steps across a crack instead of a gradient into it.
+	float3 warm = lerp(colorRock, colorEmber, smoothstep(0.05, 0.45, heat));
+	float3 hot  = lerp(warm, colorHot, smoothstep(0.30, 0.75, heat));
+	float3 col  = lerp(hot, colorCore, smoothstep(0.65, 1.0, heat));
+
+	float pulse = 0.85 + 0.15 * sin(time * 1.1 + uv.x * 9.0 + uv.y * 5.0);
+
+	// Albedo is NOT the glow. Molten rock is a black body: it emits, it does
+	// not reflect. Driving BaseColor from the heat ramp gave the rivers a
+	// bright saturated albedo, so they also picked up the sun, the sky and the
+	// directional shadow ON TOP of their own light and the plane read as
+	// orange plastic. The hotter the rock, the DARKER its albedo - the
+	// emissive is what does the work.
+	// Darkening starts LATE, otherwise a channel goes black before it ever
+	// glows and the surface reads as grey stone with a black web on it.
+	s.BaseColor = colorRock * lerp(1.0, 0.20, smoothstep(0.60, 0.95, heat));
+
+	// pow(heat, 4) keeps the bright band THIN - that is what makes a crack read
+	// as a crack rather than a glowing region. The core boost is deliberately
+	// small: at x3 the bloom washed the whole crust to a flat beige, so the
+	// dark rock vanished on screen even though its albedo is almost black.
+	// pow(heat, 2) instead of 4: the fourth power kept the channel dark until
+	// it was almost fully molten, which is what made the cracks read as black
+	// lines rather than as light coming out of the rock.
+	// pow 1.4, not 2: a squared curve keeps the shoulder almost unlit, so the
+	// crust stayed cold grey and only the middle burned - the "bright stripes
+	// on grey" look. A gentler exponent lets the warm slope actually read.
+	float coreBoost = 1.0 + smoothstep(0.82, 1.0, heat) * 1.5;
+	s.Emissive = col * pow(heat, 1.4) * glowStrength * pulse * coreBoost;
+
+	// A trace of heat everywhere. Cooled basalt under a blue sky renders as
+	// neutral grey, which is what made the crust look like concrete; a faint
+	// ember term puts the temperature back into the rock itself.
+	s.Emissive += colorEmber * 0.030 * pulse;
+
+	// Molten channels are wet-looking and glossy, crust is matte and rough.
+	s.Roughness = lerp(roughRock, roughHot, smoothstep(0.25, 0.85, heat));
+	return s;
+}
+
+// ---- LVL 7: rain over a ground material ------------------------------------
+// The albedo/normal/roughness of the ground come from the caller (a real PBR
+// texture set); this function adds the wet-patch mask and mixes.
+LS_Surface LS_ShadeRain(float3 rippleNormal, float hC, float3 groundAlbedo,
+                        float groundRoughness, float wetMask,
+                        float wetDarkening, float roughnessDry, float roughnessWet)
+{
+	LS_Surface s;
+	s.Offset = float3(0.0, 0.0, 0.0); // caller supplies the displacement
+	s.Normal = rippleNormal;
+
+	s.BaseColor = groundAlbedo * lerp(1.0, 1.0 - saturate(wetDarkening), wetMask);
+	s.BaseColor += saturate(hC) * wetMask * 0.15; // bright film on ring crests
+	s.Emissive = float3(0.0, 0.0, 0.0);
+	s.Roughness = lerp(lerp(roughnessDry, groundRoughness, 0.0), roughnessWet, wetMask);
+	return s;
+}
+
+// =============================================================================
+//  9. LOW-COST VARIANTS (mobile)
+//
+//  A phone GPU has a fraction of a desktop's shading budget, and these height
+//  fields are evaluated THREE times per pixel (centre plus two taps for the
+//  normal). The full-detail lava costs 11 FBM evaluations and 3 voronoi
+//  lookups per pixel - a voronoi alone is nine hash calls.
+//
+//  These variants keep the silhouette and the motion, and drop only the fine
+//  detail that a small screen cannot resolve anyway:
+//    * no voronoi cobbles, no thin crack grooves
+//    * no domain warping
+//    * fewer octaves
+//  Same signatures as the full versions, so the material graphs are identical
+//  apart from which function they call.
+// =============================================================================
+
+// Two octaves of value noise, fully unrolled and with the noise type fixed.
+//
+// This is where the real mobile saving is. LS_FBM takes its octave count and
+// its noise type as PARAMETERS, so the compiler cannot know either: it emits
+// all six loop iterations and BOTH the value-noise and gradient-noise paths.
+// Lowering the octave parameter on an instance changes nothing about the
+// compiled cost - measured, the instruction count did not move at all.
+// Hard-coding both here is what actually removes the work.
+float LS_FBM2(float3 p, float seed, float lacunarity, float persistence)
+{
+	p += seed * 57.31;
+	float n0 = LS_ValueNoise(p);
+	float n1 = LS_ValueNoise(p * lacunarity);
+	return (n0 + n1 * persistence) / (1.0 + persistence);
+}
+
+// Same, mirrored around zero for the sharp creases lava plates need.
+float LS_FBM2Ridged(float3 p, float seed, float lacunarity, float persistence)
+{
+	p += seed * 57.31;
+	float n0 = 1.0 - 2.0 * abs(LS_ValueNoise(p));
+	float n1 = 1.0 - 2.0 * abs(LS_ValueNoise(p * lacunarity));
+	return (n0 + n1 * persistence) / (1.0 + persistence);
+}
+
+// Lava without cobbles, grooves or domain warp: one unrolled ridged FBM
+// instead of three full FBMs plus a voronoi.
+float LS_HeightLavaCheap(float2 uv, float time, LS_NoiseParams np)
+{
+	return LS_FBM2Ridged(float3(uv * np.Size, time * np.Speed),
+	                     np.Seed, np.Lacunarity, np.Persistence);
+}
+
+// Animated displacement, mobile: unrolled, value noise only.
+float LS_HeightPerlinCheap(float2 uv, float time, LS_NoiseParams np)
+{
+	return LS_FBM2(float3(uv * np.Size, time * np.Speed),
+	               np.Seed, np.Lacunarity, np.Persistence);
+}
+
+// Heat without the thin glowing veins: 1 FBM instead of 2.
+float LS_LavaHeatCheap(float2 uv, float time, float plateHeight, LS_NoiseParams np,
+                       float crackThreshold, float crackSharpness,
+                       float emberScale, float emberSpeed, float emberAmount)
+{
+	// Same crack-line model as LS_LavaHeat, minus the halo and the spine: one
+	// band instead of three, and the crack scale is folded into np.Size rather
+	// than taking its own parameter.
+	float thin = LS_FBM2Ridged(float3((uv + float2(0.06, 0.021) * time * np.Speed) * 10.0, 2.7),
+	                           np.Seed + 23.0, np.Lacunarity, np.Persistence);
+
+	float width = 1.0 / max(crackSharpness, 0.001);
+	float heat = smoothstep(crackThreshold, crackThreshold + width * 0.45, thin);
+	heat *= 0.75 + 0.25 * saturate(1.0 - plateHeight);
+
+	float ember = LS_FBM2(float3(uv * emberScale, time * emberSpeed),
+	                      np.Seed + 11.0, np.Lacunarity, np.Persistence) * 0.5 + 0.5;
+
+	return saturate(heat * (1.0 + ember * emberAmount));
+}
+
+// Vortex without domain warping: 1 FBM instead of 2. The swirl and the
+// funnel - the parts that make it read as a vortex - are untouched.
+float LS_HeightVortexCheap(float2 uv, float time, LS_NoiseParams np,
+                           float swirlStrength, float swirlTightness, float swirlSpeed,
+                           float funnelDepth, float funnelTightness)
+{
+	float2 c = uv - 0.5;
+	float r = length(c);
+
+	float angle = swirlStrength * exp(-r * swirlTightness) + time * swirlSpeed;
+	float sa = sin(angle);
+	float ca = cos(angle);
+	float2 swirled = float2(c.x * ca - c.y * sa, c.x * sa + c.y * ca) + 0.5;
+
+	float noise = LS_FBM2Ridged(float3(swirled * np.Size, time * np.Speed),
+	                            np.Seed, np.Lacunarity, np.Persistence);
+
+	float noiseFade = smoothstep(0.0, 0.12, r);
+
+	// Same two-lobe profile as the full version so the silhouette matches;
+	// the spiral rifling on the walls is the detail dropped here, since it
+	// costs an atan2 plus a sin per pixel.
+	float basin = exp(-r * r * funnelTightness * 0.30);
+	float throat = exp(-r * r * funnelTightness * 3.20);
+	float funnel = -funnelDepth * (0.42 * basin + 0.58 * throat);
+	// Starts at 0.40, not 0.30: the wide basin lobe does most of its work
+	// between 0.15 and 0.35, and fading from 0.30 erased nearly the whole
+	// funnel - the surface came out almost flat.
+	funnel *= 1.0 - smoothstep(0.40, 0.50, max(abs(c.x), abs(c.y)));
+
+	return noise * noiseFade + funnel;
+}
+
+// Rain with two drop layers instead of three.
+float LS_HeightRainCheap(float2 uv, float time,
+                         float dropRate, float ringSpeed, float ringWidth, float ringFrequency,
+                         float dropDensity, float sizeVariation)
+{
+	float h = 0.0;
+
+	for (int k = 0; k < 2; ++k)
+	{
+		float fk = float(k);
+		float2 gridUV = uv * (6.0 + fk * 5.0) + fk * 17.31;
+		float2 cell = floor(gridUV);
+		float2 f = frac(gridUV);
+
+		float3 seed = float3(cell, fk * 13.7);
+		float3 rnd = LS_Hash33(seed);
+		float2 dropPos = rnd.xy * 0.4 + 0.3;
+		float phase = LS_Hash31(seed + 5.0);
+
+		float alive = step(1.0 - dropDensity, LS_Hash31(seed + 11.0));
+		float sizeMul = lerp(1.0 - sizeVariation * 0.6, 1.0 + sizeVariation, rnd.z);
+
+		float age = frac(time * dropRate * lerp(0.8, 1.3, rnd.z) + phase);
+		float dist = length(f - dropPos);
+		float ringR = age * ringSpeed * sizeMul;
+
+		float envelope = exp(-pow((dist - ringR) / max(ringWidth * sizeMul, 0.0001), 2.0));
+		float borderFade = 1.0 - smoothstep(0.30, 0.45, dist);
+
+		h += cos((dist - ringR) * ringFrequency) * envelope * borderFade
+		   * (1.0 - age) * (1.0 - age) * alive * sizeMul;
+	}
+
+	return h * 0.5;
+}
+
+// Slow large-scale mask of wet patches / streaks left by rain.
+float LS_WetPatchMask(float2 uv, float time, LS_NoiseParams np, float scale, float contrast)
+{
+	LS_NoiseParams wetNp = np;
+	wetNp.Type = 1.0;
+	wetNp.Octaves = 3.0;
+	// note: "patch" is a reserved word in GLSL ES - keep this name portable
+	float patchNoise = LS_FBM(float3(uv * scale, time * 0.03), wetNp);
+	return saturate(0.5 + patchNoise * contrast);
+}
